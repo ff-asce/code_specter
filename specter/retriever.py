@@ -140,7 +140,7 @@ class SpectreRetriever:
         scored_entries = []
         for entry in all_entries:
             if not entry.embedding:
-                entry.embedding = self.embed(entry.semantic_surface())
+                entry.embedding = self.embed(entry.retrieval_text())
             
             similarity = self.cosine_similarity(
                 feature_spec.embedding,
@@ -200,7 +200,7 @@ class SpectreRetriever:
         """
         for entry in entries:
             if not entry.embedding:
-                entry.embedding = self.embed(entry.semantic_surface())
+                entry.embedding = self.embed(entry.retrieval_text())
         
         return entries
     
