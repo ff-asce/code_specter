@@ -31,7 +31,8 @@ class SpectreCompressor:
         source_code: str,
         active_tags: list[SemanticTag],
         existing_dependencies: list[SpectreEntry],
-        entry_id: str
+        entry_id: str,
+        source_files: Optional[list[str]] = None
     ) -> SpectreEntry:
         """
         Compress verified code with active tags into a Specter Entry.
@@ -41,15 +42,23 @@ class SpectreCompressor:
             active_tags: Human-activated semantic tags
             existing_dependencies: Related Specter entries
             entry_id: ID for the new entry
+            source_files: List of source file paths
             
         Returns:
             SpectreEntry object
         """
+        # Calculate raw token count
+        raw_token_count = self._estimate_tokens(source_code)
+        
         # Build the prompt
-        prompt = prompts.COMPRESS_EXISTING_CODE_PROMPT.format(
-            source_code=source_code,
-            active_tags=prompts.format_active_tags(active_tags),
-            dependencies=prompts.format_dependencies(existing_dependencies)
+        active_tags_section = ""
+        if active_tags:
+            active_tags_section = f"Active tags (human-validated):\n{prompts.format_active_tags(active_tags)}"
+        
+        prompt = prompts.COMPRESS_FILE_PROMPT.format(
+            dependency_context=prompts.format_dependencies(existing_dependencies),
+            source_files=source_code,
+            active_tags_section=active_tags_section
         )
         
         # Call Claude with JSON mode
@@ -64,12 +73,11 @@ class SpectreCompressor:
         
         # Parse JSON response
         response_text = response.content[0].text
-        
-        # Extract JSON from response (handle markdown code blocks)
         json_text = self._extract_json(response_text)
         entry_data = json.loads(json_text)
         
         # Create SpectreEntry
+        timestamp = get_timestamp()
         entry = SpectreEntry(
             id=entry_id,
             description=entry_data.get("description", ""),
@@ -78,20 +86,33 @@ class SpectreCompressor:
             dependencies=entry_data.get("dependencies", []),
             patterns=entry_data.get("patterns", []),
             anchor=entry_data.get("anchor"),
-            source_files=[],  # Will be set by caller
-            created_at=get_timestamp(),
+            questions=entry_data.get("questions", []),
+            source_files=source_files or [],
+            created_at=timestamp,
+            updated_at=timestamp,
             state="active",
-            lower_confidence=False
+            confidence="verified" if active_tags else "bootstrap",
+            raw_token_count=raw_token_count,
+            entry_token_count=0,  # Will be calculated below
+            budget_exceeded=False
         )
         
-        # Check compression ratio
-        source_tokens = len(source_code) // 4
-        entry_tokens = entry.token_count()
-        ratio = entry_tokens / source_tokens if source_tokens > 0 else 0
+        # Calculate entry token count
+        entry.entry_token_count = self._estimate_tokens(entry.retrieval_text())
+        
+        # Check compression ratio and retry if needed
+        ratio = entry.compression_ratio()
+        if ratio > 0.20:
+            print(f"⚠ Compression ratio {ratio:.1%} exceeds budget, attempting to tighten...")
+            entry = self._tighten_entry(entry, ratio)
+            ratio = entry.compression_ratio()
+            
+            if ratio > 0.20:
+                print(f"⚠ Still over budget after tightening: {ratio:.1%}")
+                entry.budget_exceeded = True
         
         if ratio > 0.15:
-            print(f"⚠ Warning: Compression ratio {ratio:.2%} exceeds 15% target")
-            print(f"  Source: {source_tokens} tokens, Entry: {entry_tokens} tokens")
+            print(f"⚠ Warning: Compression ratio {ratio:.1%} exceeds 15% target for {entry_id}")
         
         return entry
     
@@ -110,19 +131,54 @@ class SpectreCompressor:
             existing_entries: Previously compressed entries for context
             
         Returns:
-            SpectreEntry object with lower_confidence=True
+            SpectreEntry object with confidence="bootstrap"
         """
         # Read source code
         with open(file_path, 'r') as f:
             source_code = f.read()
         
-        # Build the prompt
-        prompt = prompts.COMPRESS_FILE_PROMPT.format(
+        # Use the main compress method with no active tags
+        return self.compress(
             source_code=source_code,
-            existing_entries=prompts.format_dependencies(existing_entries)
+            active_tags=[],
+            existing_dependencies=existing_entries,
+            entry_id=entry_id,
+            source_files=[str(file_path)]
+        )
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """
+        Estimate token count for text.
+        
+        Uses rough approximation: 1 token ≈ 4 characters.
+        
+        Args:
+            text: Text to estimate
+            
+        Returns:
+            Estimated token count
+        """
+        return len(text) // 4
+    
+    def _tighten_entry(self, entry: SpectreEntry, current_ratio: float) -> SpectreEntry:
+        """
+        Attempt to tighten an entry that exceeds the token budget.
+        
+        Args:
+            entry: Entry to tighten
+            current_ratio: Current compression ratio
+            
+        Returns:
+            Tightened entry
+        """
+        # Build tighten prompt
+        entry_json = json.dumps(entry.to_dict(), indent=2)
+        prompt = prompts.TIGHTEN_PROMPT.format(
+            ratio=current_ratio,
+            entry=entry_json
         )
         
-        # Call Claude with JSON mode
+        # Call Claude
         response = self.client.messages.create(
             model=self.model,
             max_tokens=4096,
@@ -132,33 +188,23 @@ class SpectreCompressor:
             ]
         )
         
-        # Parse JSON response
+        # Parse response
         response_text = response.content[0].text
         json_text = self._extract_json(response_text)
-        entry_data = json.loads(json_text)
+        tightened_data = json.loads(json_text)
         
-        # Create SpectreEntry
-        entry = SpectreEntry(
-            id=entry_id,
-            description=entry_data.get("description", ""),
-            interface=entry_data.get("interface", ""),
-            invariants=entry_data.get("invariants", []),
-            dependencies=entry_data.get("dependencies", []),
-            patterns=entry_data.get("patterns", []),
-            anchor=entry_data.get("anchor"),
-            source_files=[str(file_path)],
-            created_at=get_timestamp(),
-            state="active",
-            lower_confidence=True  # Bootstrap entries are lower confidence
-        )
+        # Update entry with tightened data
+        entry.description = tightened_data.get("description", entry.description)
+        entry.interface = tightened_data.get("interface", entry.interface)
+        entry.invariants = tightened_data.get("invariants", entry.invariants)
+        entry.dependencies = tightened_data.get("dependencies", entry.dependencies)
+        entry.patterns = tightened_data.get("patterns", entry.patterns)
+        entry.anchor = tightened_data.get("anchor", entry.anchor)
+        entry.questions = tightened_data.get("questions", entry.questions)
         
-        # Check compression ratio
-        source_tokens = len(source_code) // 4
-        entry_tokens = entry.token_count()
-        ratio = entry_tokens / source_tokens if source_tokens > 0 else 0
-        
-        if ratio > 0.15:
-            print(f"⚠ Warning: Compression ratio {ratio:.2%} exceeds 15% target for {entry_id}")
+        # Recalculate entry token count
+        entry.entry_token_count = self._estimate_tokens(entry.retrieval_text())
+        entry.updated_at = get_timestamp()
         
         return entry
     
