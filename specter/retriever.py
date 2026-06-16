@@ -105,6 +105,61 @@ class SpectreRetriever:
         
         return dot_product / (norm1 * norm2)
     
+    def search(
+        self,
+        query: str,
+        entries: list[SpectreEntry],
+        top_k: int = 5,
+        include_dependencies: bool = True
+    ) -> list[tuple[SpectreEntry, float]]:
+        """
+        Search for entries relevant to a query.
+        
+        Args:
+            query: Search query
+            entries: List of entries to search
+            top_k: Number of results to return
+            include_dependencies: Whether to include dependencies of top results
+            
+        Returns:
+            List of (entry, score) tuples sorted by relevance
+        """
+        if not entries:
+            return []
+        
+        # Embed query
+        query_embedding = self.embed(query)
+        
+        # Score all entries
+        scored = []
+        for entry in entries:
+            if not entry.embedding:
+                entry.embedding = self.embed(entry.retrieval_text())
+            
+            score = self.cosine_similarity(query_embedding, entry.embedding)
+            scored.append((entry, score))
+        
+        # Sort by score
+        scored.sort(key=lambda x: x[1], reverse=True)
+        
+        # Take top-k
+        results = scored[:top_k]
+        
+        # Optionally include dependencies
+        if include_dependencies:
+            result_ids = {entry.id for entry, _ in results}
+            for entry, score in results[:]:
+                for dep_id in entry.dependencies:
+                    if dep_id not in result_ids:
+                        # Find the dependency entry
+                        for e in entries:
+                            if e.id == dep_id:
+                                results.append((e, score * 0.8))  # Lower score for dependencies
+                                result_ids.add(dep_id)
+                                break
+        
+        return results
+    
     def retrieve_slice(
         self,
         feature_spec: FeatureSpec,
