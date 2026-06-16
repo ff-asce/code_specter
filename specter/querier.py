@@ -261,4 +261,3 @@ class SpectreQuerier:
         return "\n".join(lines)
 
 
-# Made with Bob

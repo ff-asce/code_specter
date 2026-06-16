@@ -78,4 +78,3 @@ Generation comes after we've validated those foundations.
         self.console.print("\n")
 
 
-# Made with Bob

@@ -304,4 +304,3 @@ class SpectreCompressor:
         
         return code.strip()
 
-# Made with Bob

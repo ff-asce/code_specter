@@ -264,4 +264,3 @@ class SpectreDigger:
         return "\n".join(lines)
 
 
-# Made with Bob

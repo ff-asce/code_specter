@@ -188,4 +188,3 @@ class SpectreStore:
         from datetime import datetime
         return datetime.utcnow().isoformat() + "Z"
 
-# Made with Bob

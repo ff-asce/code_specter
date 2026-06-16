@@ -440,4 +440,3 @@ class SpectreBuilder:
         self.console.print("\n[yellow]Note:[/yellow] All entries are bootstrap confidence (LLM-derived, no human verification).")
         self.console.print("      Use [bold]specter query[/bold] to explore. Use [bold]specter diff <file>[/bold] after changes.\n")
 
-# Made with Bob

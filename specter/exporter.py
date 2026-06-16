@@ -239,4 +239,3 @@ class SpectreExporter:
         return entry_id.lower().replace(".", "").replace("_", "-")
 
 
-# Made with Bob

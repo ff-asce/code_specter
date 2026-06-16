@@ -198,7 +198,6 @@ def format_entries_summary(entries: list) -> str:
         formatted.append(f"- {entry.id}: {entry.description[:100]}...")
     return "\n".join(formatted)
 
-# Made with Bob
 
 
 # ============================================================================
