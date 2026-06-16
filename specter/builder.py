@@ -5,8 +5,10 @@ Walks a codebase, groups files into modules, and compresses them into Specter en
 """
 
 import ast
+import os
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime
 from typing import Dict, List, Set
 from rich.console import Console
 from rich.table import Table
@@ -14,7 +16,7 @@ from rich.table import Table
 from .store import SpectreStore
 from .compressor import SpectreCompressor
 from .retriever import SpectreRetriever
-from .schema import create_entry_id
+from .schema import create_entry_id, BuildReport
 
 
 class SpectreBuilder:
@@ -42,14 +44,19 @@ class SpectreBuilder:
     def build(
         self,
         source_root: Path,
-        file_patterns: List[str] = None
-    ) -> None:
+        file_patterns: List[str] = None,
+        force_rebuild: bool = False
+    ) -> BuildReport:
         """
         Build a Specter from a codebase.
         
         Args:
             source_root: Root directory of the codebase
             file_patterns: Glob patterns for files to include (default: ["**/*.py"])
+            force_rebuild: If True, rebuild all entries even if unchanged
+            
+        Returns:
+            BuildReport with statistics
         """
         if file_patterns is None:
             file_patterns = ["**/*.py"]
@@ -58,6 +65,15 @@ class SpectreBuilder:
         
         self.console.print(f"\n[bold]Building Specter from {source_root}[/bold]\n")
         
+        # Load existing entries for incremental build
+        existing_entries_map = {}
+        if not force_rebuild:
+            try:
+                existing_entries = self.store.load_all()
+                existing_entries_map = {e.id: e for e in existing_entries}
+            except:
+                pass
+        
         # 1. DISCOVER
         self.console.print("📁 Discovering files...")
         files = self._discover_files(source_root, file_patterns)
@@ -65,7 +81,17 @@ class SpectreBuilder:
         
         if not files:
             self.console.print("[yellow]No files found. Exiting.[/yellow]")
-            return
+            return BuildReport(
+                total_files=0,
+                entries_created=0,
+                entries_skipped=0,
+                entries_updated=0,
+                entries_stale=0,
+                total_raw_tokens=0,
+                total_entry_tokens=0,
+                overall_ratio=0.0,
+                warnings=[]
+            )
         
         # 2. GROUP
         self.console.print("📦 Grouping into modules...")
@@ -81,23 +107,40 @@ class SpectreBuilder:
         ordered_ids = self._topological_sort(groups, import_graph)
         self.console.print(f"   Processing order determined\n")
         
-        # 5. COMPRESS
+        # 5. COMPRESS (with incremental build logic)
         self.console.print("[bold]🔄 Compressing modules...[/bold]\n")
         compressed_entries = []
+        entries_created = 0
+        entries_skipped = 0
+        entries_updated = 0
+        warnings = []
         
         for i, entry_id in enumerate(ordered_ids, 1):
             file_paths = groups[entry_id]
+            
+            # Check if we can skip this entry (incremental build)
+            if not force_rebuild and entry_id in existing_entries_map:
+                existing_entry = existing_entries_map[entry_id]
+                should_skip = self._should_skip_entry(existing_entry, file_paths)
+                
+                if should_skip:
+                    self.console.print(f"[{i}/{len(ordered_ids)}] Skipping {entry_id} (unchanged)")
+                    compressed_entries.append(existing_entry)
+                    entries_skipped += 1
+                    continue
+            
             self.console.print(f"[{i}/{len(ordered_ids)}] Compressing {entry_id}...")
             
             # Get previously compressed entries as context
-            existing_entries = [e for e in compressed_entries if e.id in import_graph.get(entry_id, [])]
+            all_existing = list(existing_entries_map.values()) + compressed_entries
+            dep_entries = [e for e in all_existing if e.id in import_graph.get(entry_id, [])]
             
-            # Compress each file in the group
+            # Compress the files
             if len(file_paths) == 1:
                 entry = self.compressor.compress_file(
                     file_paths[0],
                     entry_id,
-                    existing_entries
+                    dep_entries
                 )
             else:
                 # Multiple files - combine them
@@ -107,17 +150,27 @@ class SpectreBuilder:
                         combined_code += f"\n# File: {fp.name}\n" + f.read() + "\n"
                 
                 entry = self.compressor.compress_file(
-                    file_paths[0],  # Use first file path as reference
+                    file_paths[0],
                     entry_id,
-                    existing_entries
+                    dep_entries
                 )
                 entry.source_files = [str(fp) for fp in file_paths]
             
             compressed_entries.append(entry)
             
+            # Track if this is new or updated
+            if entry_id in existing_entries_map:
+                entries_updated += 1
+            else:
+                entries_created += 1
+            
+            # Check for warnings
+            if entry.budget_exceeded:
+                warnings.append(f"{entry_id}: Token budget exceeded ({entry.compression_ratio():.1%})")
+            
             # Show compression stats
-            total_lines = sum(len(open(fp).readlines()) for fp in file_paths)
-            self.console.print(f"   ✓ {total_lines} lines → {entry.token_count()} tokens")
+            ratio = entry.compression_ratio()
+            self.console.print(f"   ✓ {entry.raw_token_count} → {entry.entry_token_count} tokens ({ratio:.1%})")
         
         # 6. EMBED
         self.console.print("\n🧮 Computing embeddings...")
@@ -128,9 +181,56 @@ class SpectreBuilder:
         for entry in compressed_entries:
             self.store.save_entry(entry)
         
-        # 8. REPORT
+        # 8. BUILD REPORT
+        total_raw_tokens = sum(e.raw_token_count for e in compressed_entries)
+        total_entry_tokens = sum(e.entry_token_count for e in compressed_entries)
+        overall_ratio = total_entry_tokens / total_raw_tokens if total_raw_tokens > 0 else 0.0
+        
+        report = BuildReport(
+            total_files=len(files),
+            entries_created=entries_created,
+            entries_skipped=entries_skipped,
+            entries_updated=entries_updated,
+            entries_stale=0,  # TODO: Track stale entries
+            total_raw_tokens=total_raw_tokens,
+            total_entry_tokens=total_entry_tokens,
+            overall_ratio=overall_ratio,
+            warnings=warnings
+        )
+        
+        # 9. DISPLAY REPORT
         self.console.print("\n")
-        self.report()
+        self.report(report)
+        
+        return report
+    
+    def _should_skip_entry(self, entry, file_paths: List[Path]) -> bool:
+        """
+        Check if an entry can be skipped (unchanged files).
+        
+        Args:
+            entry: Existing entry
+            file_paths: Current file paths for this entry
+            
+        Returns:
+            True if entry can be skipped
+        """
+        # Parse entry updated_at timestamp
+        try:
+            entry_time = datetime.fromisoformat(entry.updated_at.replace('Z', '+00:00'))
+        except:
+            return False
+        
+        # Check if any file is newer than the entry
+        for fp in file_paths:
+            try:
+                file_mtime = datetime.fromtimestamp(os.path.getmtime(fp))
+                if file_mtime > entry_time:
+                    return False
+            except:
+                return False
+        
+        return True
     
     def _discover_files(
         self,
@@ -289,58 +389,55 @@ class SpectreBuilder:
         
         return result
     
-    def report(self) -> None:
-        """Print a summary report of the built Specter."""
-        summary = self.store.summary()
+    def report(self, build_report: BuildReport) -> None:
+        """
+        Print a summary report of the build.
+        
+        Args:
+            build_report: Build report with statistics
+        """
         entries = self.store.load_all()
         
         # Create table
         table = Table(title="Specter Build Summary")
         table.add_column("Entry ID", style="cyan")
         table.add_column("Files", justify="right")
-        table.add_column("Raw Lines", justify="right")
+        table.add_column("Raw Tokens", justify="right")
         table.add_column("Entry Tokens", justify="right")
         table.add_column("Ratio", justify="right")
-        table.add_column("State", style="green")
-        
-        total_lines = 0
-        total_tokens = 0
+        table.add_column("Confidence", style="green")
         
         for entry in sorted(entries, key=lambda e: e.id):
-            # Calculate raw lines
-            raw_lines = 0
-            for source_file in entry.source_files:
-                try:
-                    with open(source_file, 'r') as f:
-                        raw_lines += len(f.readlines())
-                except:
-                    pass
-            
-            entry_tokens = entry.token_count()
-            ratio = entry_tokens / (raw_lines * 0.25) if raw_lines > 0 else 0
-            
-            total_lines += raw_lines
-            total_tokens += entry_tokens
+            ratio = entry.compression_ratio()
             
             table.add_row(
                 entry.id,
                 str(len(entry.source_files)),
-                str(raw_lines),
-                str(entry_tokens),
-                f"{ratio:.2%}",
-                entry.state
+                f"{entry.raw_token_count:,}",
+                f"{entry.entry_token_count:,}",
+                f"{ratio:.1%}",
+                entry.confidence
             )
         
         self.console.print(table)
         
         # Overall stats
-        overall_ratio = total_tokens / (total_lines * 0.25) if total_lines > 0 else 0
+        self.console.print(f"\n[bold]Build Summary[/bold]")
+        self.console.print(f"  Total files: {build_report.total_files}")
+        self.console.print(f"  Entries created: {build_report.entries_created}")
+        self.console.print(f"  Entries updated: {build_report.entries_updated}")
+        self.console.print(f"  Entries skipped: {build_report.entries_skipped} (unchanged)")
         
-        self.console.print(f"\n[bold]Total Compression:[/bold] {overall_ratio:.1%}")
-        self.console.print(f"  {summary['total_entries']} entries")
-        self.console.print(f"  {total_lines} raw lines → {total_tokens} entry tokens")
-        self.console.print(f"  {summary['bootstrap_entries']} bootstrap entries (lower confidence)")
-        self.console.print("\n[yellow]Note:[/yellow] Bootstrap entries haven't been human-validated.")
-        self.console.print("      Use [bold]specter run[/bold] for future features with validation.\n")
+        self.console.print(f"\n[bold]Compression:[/bold] {build_report.overall_ratio:.1%}")
+        self.console.print(f"  {build_report.total_raw_tokens:,} raw tokens → {build_report.total_entry_tokens:,} entry tokens")
+        
+        # Warnings
+        if build_report.warnings:
+            self.console.print(f"\n[yellow]Warnings:[/yellow]")
+            for warning in build_report.warnings:
+                self.console.print(f"  ⚠ {warning}")
+        
+        self.console.print("\n[yellow]Note:[/yellow] All entries are bootstrap confidence (LLM-derived, no human verification).")
+        self.console.print("      Use [bold]specter query[/bold] to explore. Use [bold]specter diff <file>[/bold] after changes.\n")
 
 # Made with Bob
